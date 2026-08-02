@@ -147,19 +147,23 @@ async def bulk_upsert_catalog(entries: list[tuple[str, str]], source: str) -> in
         return None
 
 
-async def get_catalog_page(skip: int, limit: int) -> list[dict]:
-    """Return a page of catalog entries, newest first."""
+async def get_catalog_page(skip: int, limit: int, source: str | None = None) -> list[dict]:
+    """Return a page of catalog entries, newest first. If `source` is given,
+    only entries belonging to that package (sticker-pack short name, or
+    "user" for crowdsourced ones) are returned."""
+    query = {"source": source} if source is not None else {}
     try:
-        cursor = catalog_col.find({}).sort("added_at", -1).skip(skip).limit(limit)
+        cursor = catalog_col.find(query).sort("added_at", -1).skip(skip).limit(limit)
         return [doc async for doc in cursor]
     except PyMongoError:
         logger.exception("get_catalog_page failed — is MongoDB reachable at %s ?", MONGO_URI)
         return []
 
 
-async def get_catalog_count() -> int:
+async def get_catalog_count(source: str | None = None) -> int:
+    query = {"source": source} if source is not None else {}
     try:
-        return await catalog_col.count_documents({})
+        return await catalog_col.count_documents(query)
     except PyMongoError:
         logger.exception("get_catalog_count failed — is MongoDB reachable at %s ?", MONGO_URI)
         return 0
@@ -207,4 +211,57 @@ async def delete_catalog_entry(custom_emoji_id: str) -> bool | None:
         return result.deleted_count > 0
     except PyMongoError:
         logger.exception("delete_catalog_entry failed — is MongoDB reachable at %s ?", MONGO_URI)
+        return None
+
+
+# ------------------------------------------------------------------
+# Packages — grouping catalog entries by their `source`
+# ------------------------------------------------------------------
+# A "package" is just the distinct set of `source` values in the catalog:
+# either a bulk-imported sticker pack's short name (from /addpack), or the
+# literal string "user" for crowdsourced submissions. These helpers let the
+# bot list packages (with entry counts) and act on a whole package at once.
+
+async def get_distinct_sources(skip: int = 0, limit: int = 20) -> list[dict]:
+    """
+    Return a page of packages as [{"source": <name>, "count": <n>}, ...],
+    sorted alphabetically by source name for a stable, predictable order
+    (the bot relies on this order + skip/limit to re-resolve which package
+    a button referred to, so keep the sort deterministic if you touch this).
+    """
+    try:
+        pipeline = [
+            {"$group": {"_id": "$source", "count": {"$sum": 1}}},
+            {"$sort": {"_id": 1}},
+            {"$skip": skip},
+            {"$limit": limit},
+        ]
+        cursor = catalog_col.aggregate(pipeline)
+        return [{"source": doc["_id"], "count": doc["count"]} async for doc in cursor]
+    except PyMongoError:
+        logger.exception("get_distinct_sources failed — is MongoDB reachable at %s ?", MONGO_URI)
+        return []
+
+
+async def get_source_count() -> int:
+    """Number of distinct packages currently in the catalog."""
+    try:
+        sources = await catalog_col.distinct("source")
+        return len(sources)
+    except PyMongoError:
+        logger.exception("get_source_count failed — is MongoDB reachable at %s ?", MONGO_URI)
+        return 0
+
+
+async def delete_package(source: str) -> int | None:
+    """
+    Admin delete: remove every catalog entry belonging to one package
+    (source). Returns the number of entries deleted, or None if MongoDB is
+    unreachable.
+    """
+    try:
+        result = await catalog_col.delete_many({"source": source})
+        return result.deleted_count
+    except PyMongoError:
+        logger.exception("delete_package failed — is MongoDB reachable at %s ?", MONGO_URI)
         return None
