@@ -62,6 +62,7 @@ BOT_USERNAME = ""  # filled in at startup via get_me()
 CATALOG_PAGE_SIZE = 30
 CATALOG_COLUMNS = 5  # how many entries per row in the catalog text grid
 BUTTONS_PER_ROW = 6  # was 4 — 3 per row leaves more breathing room, more rows
+PACKAGES_PAGE_SIZE = 8  # packages get one full row each (+ admin delete button), keep this small
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -171,7 +172,10 @@ def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
     shown to admins — regular users don't get a button that just tells them
     'admin-only' when they tap it. (Button labels can't carry premium-emoji
     entities — that's a Bot API limitation — so these stay plain unicode.)"""
-    top_row = [InlineKeyboardButton("🖼 Gallery", callback_data="gallery:0")]
+    top_row = [
+        InlineKeyboardButton("🖼 Gallery", callback_data="gallery:0"),
+        InlineKeyboardButton("📦 Packages", callback_data="pkgs:0"),
+    ]
     if is_admin_user:
         top_row.append(InlineKeyboardButton("📊 Stats", callback_data="stats"))
 
@@ -219,7 +223,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Deep-link: t.me/YourBot?start=emoji_<id> jumps straight to that emoji's code snippet
     if context.args and context.args[0].startswith("emoji_"):
         emoji_id = context.args[0][len("emoji_"):]
-        await send_emoji_snippet(update.message, emoji_id)
+        await send_emoji_snippet(update.message, emoji_id, is_admin_user=is_admin(user.id))
         return
 
     icon = "⭐"
@@ -239,8 +243,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def send_emoji_snippet(message, emoji_id: str):
-    """Shared by /start deep-link and the gallery 'Get' button."""
+async def send_emoji_snippet(message, emoji_id: str, is_admin_user: bool = False):
+    """Shared by /start deep-link, the gallery 'Get' button, and package
+    browsing — this is the one place a "number tap" always ends up, so it's
+    also where we surface the admin-only delete action for that entry."""
     entry = await db.get_catalog_entry(emoji_id)
     fallback = entry["fallback"] if entry else "⭐"
 
@@ -249,9 +255,16 @@ async def send_emoji_snippet(message, emoji_id: str):
     entities = [build_custom_emoji_entity(emoji_id, offset=utf16_len(header), length=utf16_len(fallback))]
 
     await message.reply_text(text=full_text, entities=entities)
+
+    delete_markup = None
+    if is_admin_user:
+        delete_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🗑 Delete this emoji", callback_data=f"del:{emoji_id}")]]
+        )
     await message.reply_text(
         text=f"{build_code_snippet(emoji_id, fallback)}\n\nShare link:\n{build_deep_link(emoji_id)}",
         parse_mode="HTML",
+        reply_markup=delete_markup,
     )
     await db.increment_usage(emoji_id)
 
@@ -263,13 +276,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{icon} Available Commands\n",
         "/start — Open the main menu",
         "/help — Show this message",
-        "/gallery — Browse the emoji catalog",
+        "/gallery — Browse the whole emoji catalog",
+        "/packages — Browse the catalog grouped by pack",
     ]
     if is_admin(user.id):
         lines.append("/stats — Bot usage stats (admin-only)")
         lines.append("/addpack <short_name> — Bulk-import a sticker pack (admin-only)")
         lines.append("/editentry <emoji_id> <new_fallback> — Edit a catalog entry (admin-only)")
         lines.append("/delentry <emoji_id> — Delete a catalog entry (admin-only)")
+        lines.append("\nIn /packages and /gallery, admins also get 🗑 delete buttons — per package or per entry — right in the chat.")
     lines.append("\nSend any message containing a premium emoji and I'll add it to the catalog and reply with its custom_emoji_id.")
 
     text = "\n".join(lines)
@@ -425,6 +440,54 @@ async def delentry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, entities=entities)
 
 
+def _render_catalog_grid(header: str, header_icon: str, entries: list[dict], skip: int) -> tuple[str, list[MessageEntity]]:
+    """
+    Shared numbered-grid renderer used by both the all-entries gallery and
+    package browsing. Numbers keep counting up from `skip` (skip+1, skip+2,
+    ...) instead of resetting to 1 every page, laid out as a
+    CATALOG_COLUMNS-wide grid (plain numbers — no digit emoji, they read
+    cleaner this way) instead of one entry per line.
+    """
+    body = ""
+    entities = []
+
+    header_entity = icon_entity(header_icon, offset=0)
+    if header_entity:
+        entities.append(header_entity)
+
+    cursor = utf16_len(header)
+
+    for idx, entry in enumerate(entries):
+        global_num = skip + idx + 1
+        fallback = entry.get("fallback", "⭐")
+
+        prefix = f"{global_num}."
+        body += prefix
+        cursor += utf16_len(prefix)
+
+        entities.append(build_custom_emoji_entity(entry["_id"], offset=cursor, length=utf16_len(fallback)))
+        body += fallback
+        cursor += utf16_len(fallback)
+
+        is_last_entry = idx == len(entries) - 1
+        is_row_end = (idx + 1) % CATALOG_COLUMNS == 0
+        sep = "\n" if (is_last_entry or is_row_end) else "  "
+        body += sep
+        cursor += utf16_len(sep)
+
+    return header + body, entities
+
+
+def _number_button_rows(entries: list[dict], skip: int) -> list[list[InlineKeyboardButton]]:
+    """Plain-number button grid — the Bot API doesn't support custom-emoji
+    entities inside inline keyboard button text, only in message bodies."""
+    number_buttons = [
+        InlineKeyboardButton(str(skip + i + 1), callback_data=f"get:{entry['_id']}")
+        for i, entry in enumerate(entries)
+    ]
+    return [number_buttons[i:i + BUTTONS_PER_ROW] for i in range(0, len(number_buttons), BUTTONS_PER_ROW)]
+
+
 async def gallery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_gallery_page(update.message, page=0)
 
@@ -454,46 +517,9 @@ async def send_gallery_page(message, page: int, edit: bool = False):
 
     header_icon = "🖼"
     header = f"{header_icon} Emoji Catalog (page {page + 1}) — tap a number to get its code:\n\n"
-    body = ""
-    entities = []
+    full_text, entities = _render_catalog_grid(header, header_icon, entries, skip)
 
-    header_entity = icon_entity(header_icon, offset=0)
-    if header_entity:
-        entities.append(header_entity)
-
-    cursor = utf16_len(header)
-
-    # Numbers keep counting up across pages (skip+1, skip+2, ...) instead of
-    # resetting to 1 every page. Laid out as a CATALOG_COLUMNS-wide grid
-    # (plain numbers — no digit emoji, they read cleaner this way) instead
-    # of one entry per line.
-    for idx, entry in enumerate(entries):
-        global_num = skip + idx + 1
-        fallback = entry.get("fallback", "⭐")
-
-        prefix = f"{global_num}."
-        body += prefix
-        cursor += utf16_len(prefix)
-
-        entities.append(build_custom_emoji_entity(entry["_id"], offset=cursor, length=utf16_len(fallback)))
-        body += fallback
-        cursor += utf16_len(fallback)
-
-        is_last_entry = idx == len(entries) - 1
-        is_row_end = (idx + 1) % CATALOG_COLUMNS == 0
-        sep = "\n" if (is_last_entry or is_row_end) else "  "
-        body += sep
-        cursor += utf16_len(sep)
-
-    full_text = header + body
-
-    # Plain-number button labels — the Bot API doesn't support custom-emoji
-    # entities inside inline keyboard button text, only in message bodies.
-    number_buttons = [
-        InlineKeyboardButton(str(skip + i + 1), callback_data=f"get:{entry['_id']}")
-        for i, entry in enumerate(entries)
-    ]
-    button_rows = [number_buttons[i:i + BUTTONS_PER_ROW] for i in range(0, len(number_buttons), BUTTONS_PER_ROW)]
+    button_rows = _number_button_rows(entries, skip)
 
     nav_row = []
     if page > 0:
@@ -511,19 +537,245 @@ async def send_gallery_page(message, page: int, edit: bool = False):
         await message.reply_text(text=full_text, entities=entities, reply_markup=markup)
 
 
+# ------------------------------------------------------------------
+# Packages — browse the catalog grouped by source (sticker pack or "user")
+# ------------------------------------------------------------------
+# Callback data scheme (all resolved by re-querying get_distinct_sources with
+# the SAME page/skip/limit that built the original keyboard, then indexing
+# into that list — this keeps callback_data short (well under Telegram's
+# 64-byte limit) instead of embedding the (potentially long) package name
+# directly. Trade-off: if packages are added/removed between a user opening
+# a keyboard and tapping it, the index could point at a different package —
+# rare in practice, and /packages always gets a fresh, correct list.
+#   pkgs:<page>                 -> list of packages
+#   po:<page>:<idx>             -> open package -> package view, subpage 0
+#   pv:<page>:<idx>:<subpage>   -> paginate inside a package
+#   delpkg:<page>:<idx>         -> admin: ask "are you sure?" for whole-package delete
+#   delpkgy:<page>:<idx>        -> admin: confirmed, actually delete the package
+#   delpkgn:<page>:<idx>        -> admin: cancelled, back to package view
+#   del:<emoji_id>              -> admin: delete one catalog entry (see send_emoji_snippet)
+
+async def packages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await send_packages_page(update.message, page=0, is_admin_user=is_admin(user.id))
+
+
+async def send_packages_page(message, page: int, is_admin_user: bool, edit: bool = False):
+    total = await db.get_source_count()
+    if total == 0:
+        icon = "📦"
+        text = f"{icon} No packages yet — ask an admin to /addpack a sticker set, or send a premium emoji to start the 'user' package."
+        entity = icon_entity(icon, offset=0)
+        entities = [entity] if entity else None
+        if edit:
+            await message.edit_text(text, entities=entities)
+        else:
+            await message.reply_text(text, entities=entities)
+        return
+
+    skip = page * PACKAGES_PAGE_SIZE
+    sources = await db.get_distinct_sources(skip=skip, limit=PACKAGES_PAGE_SIZE)
+
+    if not sources:
+        if page != 0:
+            await send_packages_page(message, page=0, is_admin_user=is_admin_user, edit=edit)
+        return
+
+    icon = "📦"
+    text = f"{icon} Packages (page {page + 1}) — tap one to browse it:"
+    entity = icon_entity(icon, offset=0)
+    entities = [entity] if entity else None
+
+    button_rows = []
+    for idx, pkg in enumerate(sources):
+        row = [
+            InlineKeyboardButton(
+                f"📦 {pkg['source']} ({pkg['count']})", callback_data=f"po:{page}:{idx}"
+            )
+        ]
+        if is_admin_user:
+            row.append(InlineKeyboardButton("🗑", callback_data=f"delpkg:{page}:{idx}"))
+        button_rows.append(row)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pkgs:{page - 1}"))
+    if skip + PACKAGES_PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"pkgs:{page + 1}"))
+    if nav_row:
+        button_rows.append(nav_row)
+
+    markup = InlineKeyboardMarkup(button_rows)
+
+    if edit:
+        await message.edit_text(text=text, entities=entities, reply_markup=markup)
+    else:
+        await message.reply_text(text=text, entities=entities, reply_markup=markup)
+
+
+async def _resolve_package(page: int, idx: int) -> dict | None:
+    """Re-fetch the packages page a callback's (page, idx) came from and
+    return that entry, or None if it's no longer there (package renamed/
+    deleted, or list changed size in the meantime)."""
+    sources = await db.get_distinct_sources(skip=page * PACKAGES_PAGE_SIZE, limit=PACKAGES_PAGE_SIZE)
+    if 0 <= idx < len(sources):
+        return sources[idx]
+    return None
+
+
+async def send_package_view(message, page: int, idx: int, subpage: int, is_admin_user: bool, edit: bool = False):
+    pkg = await _resolve_package(page, idx)
+    if pkg is None:
+        text, entities = icon_message("⚠️", "That package isn't available anymore — try /packages again.")
+        back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Packages", callback_data="pkgs:0")]])
+        if edit:
+            await message.edit_text(text, entities=entities, reply_markup=back_markup)
+        else:
+            await message.reply_text(text, entities=entities, reply_markup=back_markup)
+        return
+
+    source = pkg["source"]
+    total = await db.get_catalog_count(source=source)
+    if total == 0:
+        text, entities = icon_message("📦", f"Package '{source}' is now empty.")
+        back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Packages", callback_data=f"pkgs:{page}")]])
+        if edit:
+            await message.edit_text(text, entities=entities, reply_markup=back_markup)
+        else:
+            await message.reply_text(text, entities=entities, reply_markup=back_markup)
+        return
+
+    skip = subpage * CATALOG_PAGE_SIZE
+    entries = await db.get_catalog_page(skip=skip, limit=CATALOG_PAGE_SIZE, source=source)
+
+    if not entries:
+        if subpage != 0:
+            await send_package_view(message, page, idx, 0, is_admin_user, edit=edit)
+        return
+
+    header_icon = "📦"
+    header = f"{header_icon} {source} (page {subpage + 1}) — tap a number to get its code:\n\n"
+    full_text, entities = _render_catalog_grid(header, header_icon, entries, skip)
+
+    button_rows = _number_button_rows(entries, skip)
+
+    nav_row = []
+    if subpage > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pv:{page}:{idx}:{subpage - 1}"))
+    if skip + CATALOG_PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"pv:{page}:{idx}:{subpage + 1}"))
+    if nav_row:
+        button_rows.append(nav_row)
+
+    footer_row = [InlineKeyboardButton("📦 Back to Packages", callback_data=f"pkgs:{page}")]
+    if is_admin_user:
+        footer_row.append(InlineKeyboardButton("🗑 Delete package", callback_data=f"delpkg:{page}:{idx}"))
+    button_rows.append(footer_row)
+
+    markup = InlineKeyboardMarkup(button_rows)
+
+    if edit:
+        await message.edit_text(text=full_text, entities=entities, reply_markup=markup)
+    else:
+        await message.reply_text(text=full_text, entities=entities, reply_markup=markup)
+
+
+async def send_package_delete_confirm(message, page: int, idx: int):
+    pkg = await _resolve_package(page, idx)
+    if pkg is None:
+        text, entities = icon_message("⚠️", "That package isn't available anymore — try /packages again.")
+        await message.edit_text(text, entities=entities)
+        return
+
+    source, count = pkg["source"], pkg["count"]
+    icon = "⚠️"
+    text = f"{icon} Delete package '{source}' and all {count} entries in it? This can't be undone."
+    entity = icon_entity(icon, offset=0)
+    entities = [entity] if entity else None
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Yes, delete", callback_data=f"delpkgy:{page}:{idx}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"delpkgn:{page}:{idx}"),
+            ]
+        ]
+    )
+    await message.edit_text(text=text, entities=entities, reply_markup=markup)
+
+
 async def gallery_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     data = query.data
+    requester_is_admin = is_admin(query.from_user.id)
+
     if data.startswith("gallery:"):
         page = int(data.split(":", 1)[1])
         await send_gallery_page(query.message, page=page, edit=True)
+
     elif data.startswith("get:"):
         emoji_id = data.split(":", 1)[1]
-        await send_emoji_snippet(query.message, emoji_id)
+        await send_emoji_snippet(query.message, emoji_id, is_admin_user=requester_is_admin)
+
+    elif data.startswith("pkgs:"):
+        page = int(data.split(":", 1)[1])
+        await send_packages_page(query.message, page=page, is_admin_user=requester_is_admin, edit=True)
+
+    elif data.startswith("po:"):
+        _, page, idx = data.split(":")
+        await send_package_view(query.message, int(page), int(idx), subpage=0, is_admin_user=requester_is_admin, edit=True)
+
+    elif data.startswith("pv:"):
+        _, page, idx, subpage = data.split(":")
+        await send_package_view(query.message, int(page), int(idx), int(subpage), is_admin_user=requester_is_admin, edit=True)
+
+    elif data.startswith("delpkgy:"):
+        if not requester_is_admin:
+            await query.answer("Admin-only.", show_alert=True)
+            return
+        _, page, idx = data.split(":")
+        pkg = await _resolve_package(int(page), int(idx))
+        if pkg is None:
+            text, entities = icon_message("⚠️", "That package isn't available anymore — try /packages again.")
+            await query.message.edit_text(text, entities=entities)
+            return
+        deleted = await db.delete_package(pkg["source"])
+        if deleted is None:
+            text, entities = icon_message("⚠️", "Couldn't delete — database unreachable.")
+            await query.message.edit_text(text, entities=entities)
+        else:
+            text, entities = icon_message("🗑", f"Deleted package '{pkg['source']}' ({deleted} entries removed).")
+            back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Packages", callback_data="pkgs:0")]])
+            await query.message.edit_text(text, entities=entities, reply_markup=back_markup)
+
+    elif data.startswith("delpkgn:"):
+        _, page, idx = data.split(":")
+        await send_package_view(query.message, int(page), int(idx), subpage=0, is_admin_user=requester_is_admin, edit=True)
+
+    elif data.startswith("delpkg:"):
+        if not requester_is_admin:
+            await query.answer("Admin-only.", show_alert=True)
+            return
+        _, page, idx = data.split(":")
+        await send_package_delete_confirm(query.message, int(page), int(idx))
+
+    elif data.startswith("del:"):
+        if not requester_is_admin:
+            await query.answer("Admin-only.", show_alert=True)
+            return
+        emoji_id = data.split(":", 1)[1]
+        ok = await db.delete_catalog_entry(emoji_id)
+        if ok is None:
+            text, entities = icon_message("⚠️", "Couldn't delete — database unreachable.")
+        elif ok:
+            text, entities = icon_message("🗑", f"Deleted catalog entry {emoji_id}.")
+        else:
+            text, entities = icon_message("⚠️", f"No catalog entry found for ID {emoji_id}.")
+        await query.message.reply_text(text, entities=entities)
+
     elif data == "stats":
-        if not is_admin(query.from_user.id):
+        if not requester_is_admin:
             text, entities = icon_message("⛔", "Stats are admin-only.")
             await query.message.reply_text(text, entities=entities)
             return
@@ -679,6 +931,7 @@ def main():
     app.add_handler(CommandHandler("editentry", editentry_command))
     app.add_handler(CommandHandler("delentry", delentry_command))
     app.add_handler(CommandHandler("gallery", gallery_command))
+    app.add_handler(CommandHandler("packages", packages_command))
     app.add_handler(CallbackQueryHandler(gallery_callback))
 
     # Filters.Entity catches messages containing at least one custom_emoji entity
