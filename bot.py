@@ -20,6 +20,7 @@ Run:
     python main.py
 """
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -56,9 +57,9 @@ DEFAULT_EMOJI_ID = os.getenv("DEFAULT_EMOJI_ID", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 BOT_USERNAME = ""  # filled in at startup via get_me()
-CATALOG_PAGE_SIZE = 8
+CATALOG_PAGE_SIZE = 30
 CATALOG_COLUMNS = 5  # how many entries per row in the catalog text grid
-BUTTONS_PER_ROW = 3  # was 4 — 3 per row leaves more breathing room, more rows
+BUTTONS_PER_ROW = 6  # was 4 — 3 per row leaves more breathing room, more rows
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -631,6 +632,20 @@ def main():
     )
 
     app.add_error_handler(error_handler)
+
+    # python-telegram-bot's run_polling() internally calls
+    # asyncio.get_event_loop() to grab a loop to run on. Python 3.14 removed
+    # the old behavior where that call would silently create a new loop if
+    # none existed yet — now it just raises RuntimeError("There is no
+    # current event loop..."), which crashes startup before polling even
+    # begins (see python-telegram-bot/python-telegram-bot#4874, still open
+    # upstream). Pre-creating and registering a loop here means PTB's
+    # get_event_loop() finds one instead of erroring. Harmless no-op on
+    # older Python versions where the implicit loop still exists.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     logger.info("Bot starting (polling)...")
     app.run_polling()
