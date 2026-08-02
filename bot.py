@@ -23,6 +23,8 @@ Run:
 import asyncio
 import logging
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -66,6 +68,19 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("premium_emoji_bot")
+
+# ------------------------------------------------------------------
+# Console noise / secret hygiene
+# ------------------------------------------------------------------
+# httpx logs every outgoing request at INFO level, INCLUDING the full URL —
+# and python-telegram-bot builds request URLs as
+# https://api.telegram.org/bot<TOKEN>/<method>, so by default your bot
+# token was printing straight to the console on every single API call
+# (getUpdates, sendMessage, ...). Bumping these loggers to WARNING kills
+# that leak and also gets rid of the per-request spam. Our own
+# "premium_emoji_bot" logger stays at INFO so startup info / errors still show.
+for _noisy_logger in ("httpx", "httpcore", "telegram", "telegram.ext.Application"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 
 # ------------------------------------------------------------------
@@ -163,7 +178,7 @@ def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
     rows = [
         top_row,
         [
-            InlineKeyboardButton("💬 Support", url="https://t.me/suryaxalone"),
+            InlineKeyboardButton("💬 Support", url="https://t.me/your_support_handle"),
         ],
     ]
     return InlineKeyboardMarkup(rows)
@@ -596,6 +611,49 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------------
+# Keep-alive HTTP server
+# ------------------------------------------------------------------
+# Polling doesn't open any port by itself, but a lot of hosts (Render,
+# Railway, Replit, Koyeb free tiers, etc.) expect the process to bind to
+# $PORT so they know it's alive / so "uptime pingers" have something to hit.
+# This runs a tiny stdlib HTTP server on a background daemon thread — it's
+# just a health check, it has nothing to do with Telegram updates, so it
+# can't interfere with app.run_polling() (which owns the main thread/loop).
+
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = (
+            b'{"status": "ok", "bot": "@' + BOT_USERNAME.encode() + b'", '
+            b'"message": "Bot is running \xe2\x9c\x85"}'
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_HEAD(self):
+        # Several hosts/uptime-pingers send HEAD instead of GET to check
+        # liveness — respond the same way, just without a body.
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        # Silence the default per-request access log — it would otherwise
+        # spam the console every time an uptime pinger hits the port.
+        pass
+
+
+def start_keep_alive_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Keep-alive HTTP server listening on 0.0.0.0:%s", port)
+
+
+# ------------------------------------------------------------------
 # Entrypoint
 # ------------------------------------------------------------------
 
@@ -632,6 +690,8 @@ def main():
     )
 
     app.add_error_handler(error_handler)
+
+    start_keep_alive_server()
 
     # python-telegram-bot's run_polling() internally calls
     # asyncio.get_event_loop() to grab a loop to run on. Python 3.14 removed
