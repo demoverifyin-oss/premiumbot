@@ -99,6 +99,7 @@ EMOJI_ICON_IDS = {
     "👥": "5150276257375586099",   # users icon
     "➡️": "5951665890079544884",   # next arrow
     "⬅️": "5951665890079544884",   # prev arrow
+    "📦": "5148009438061267151",
 }
 
 
@@ -182,7 +183,7 @@ def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
     rows = [
         top_row,
         [
-            InlineKeyboardButton("💬 Support", url="https://t.me/your_support_handle"),
+            InlineKeyboardButton("💬 Support", url="https://t.me/suryaxalone"),
         ],
     ]
     return InlineKeyboardMarkup(rows)
