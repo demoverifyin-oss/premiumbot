@@ -163,7 +163,7 @@ def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
     rows = [
         top_row,
         [
-            InlineKeyboardButton("💬 Support", url="https://t.me/your_support_handle"),
+            InlineKeyboardButton("💬 Support", url="https://t.me/suryaxalone"),
         ],
     ]
     return InlineKeyboardMarkup(rows)
